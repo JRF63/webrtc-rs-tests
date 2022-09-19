@@ -7,7 +7,7 @@ use tokio::sync::{
 };
 use webrtc::{
     api::{
-        interceptor_registry::{register_default_interceptors, configure_twcc_sender_only},
+        interceptor_registry::{configure_nack, configure_twcc},
         media_engine::{MediaEngine, MIME_TYPE_H264},
         setting_engine::SettingEngine,
         APIBuilder,
@@ -45,8 +45,8 @@ async fn peer_a(
     m.register_default_codecs()?;
 
     let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
-    // registry = configure_twcc_sender_only(registry, &mut m)?;
+    registry = configure_nack(registry, &mut m);
+    registry = configure_twcc(registry, &mut m)?;
 
     let mut setting_engine = SettingEngine::default();
     // setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::QueryAndGather);
@@ -200,7 +200,8 @@ async fn peer_b(
     m.register_default_codecs()?;
 
     let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
+    registry = configure_nack(registry, &mut m);
+    registry = configure_twcc(registry, &mut m)?;
 
     let mut setting_engine = SettingEngine::default();
     // setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::QueryAndGather);
@@ -281,7 +282,11 @@ async fn peer_b(
                                     // Almost always zero
                                     let csrc_count = rtp_packet[0] & 0b00001111;
 
-                                    let m = 3 + csrc_count as usize;
+                                    let mut m = 3 + csrc_count as usize;
+                                    if rtp_packet[0] & 0b00010000 != 0 {
+                                        // Assuming transport-cc
+                                        m += 2;
+                                    }
                                     let nalu_header = rtp_packet[4*m];
                                     let nalu_type = nalu_header & 0b00011111;
 
