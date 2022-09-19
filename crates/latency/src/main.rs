@@ -7,8 +7,9 @@ use tokio::sync::{
 };
 use webrtc::{
     api::{
-        interceptor_registry::register_default_interceptors,
+        interceptor_registry::{register_default_interceptors, configure_twcc_sender_only},
         media_engine::{MediaEngine, MIME_TYPE_H264},
+        setting_engine::SettingEngine,
         APIBuilder,
     },
     ice_transport::{
@@ -23,11 +24,13 @@ use webrtc::{
     rtp_transceiver::{
         rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
         rtp_receiver::RTCRtpReceiver,
+        rtp_transceiver_direction::RTCRtpTransceiverDirection,
+        RTCRtpTransceiverInit,
     },
     track::{
         track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
         track_remote::TrackRemote,
-    },
+    }, ice::mdns::MulticastDnsMode,
 };
 
 /// Peer A sends the H.264 stream
@@ -40,11 +43,18 @@ async fn peer_a(
 ) -> Result<(), webrtc::Error> {
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
+
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut m)?;
+    // registry = configure_twcc_sender_only(registry, &mut m)?;
+
+    let mut setting_engine = SettingEngine::default();
+    // setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::QueryAndGather);
+
     let api = APIBuilder::new()
         .with_media_engine(m)
         .with_interceptor_registry(registry)
+        .with_setting_engine(setting_engine)
         .build();
 
     let config = RTCConfiguration::default();
@@ -114,7 +124,15 @@ async fn peer_a(
     tokio::spawn(async move {
         let mut rtcp_buf = vec![0u8; 1500];
         if let Some(rtp_sender) = rtp_transceiver.sender().await {
-            while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {}
+            while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {
+                println!("Peer A RTCP: {}", rtcp_buf[1]);
+                if rtcp_buf[1] == 205 {
+                    let fmt = rtcp_buf[0] & 0b11111;
+                    println!("Peer A RTCP FB: {}", fmt);
+                } else {
+                    println!("Peer A RTCP: {}", rtcp_buf[1]);
+                }
+            }
         }
     });
 
@@ -159,7 +177,7 @@ async fn peer_a(
                         .await?;
                     timestamps.push(ts);
                 }
-                
+
                 send_complete.notify_waiters();
                 Result::<(), webrtc::Error>::Ok(())
             })
@@ -183,9 +201,14 @@ async fn peer_b(
 
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut m)?;
+
+    let mut setting_engine = SettingEngine::default();
+    // setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::QueryAndGather);
+
     let api = APIBuilder::new()
         .with_media_engine(m)
         .with_interceptor_registry(registry)
+        .with_setting_engine(setting_engine)
         .build();
 
     let config = RTCConfiguration::default();
@@ -282,7 +305,7 @@ async fn peer_b(
                                                 frag_ends += 1;
                                             }
                                         }
-                                        a => println!("nalu_type: {}", a)
+                                        _a => (), //println!("nalu_type: {}", a)
                                     }
                                 }
                             }
@@ -334,7 +357,13 @@ async fn peer_b(
     });
 
     peer_connection
-        .add_transceiver_from_kind(RTPCodecType::Video, &[])
+        .add_transceiver_from_kind(
+            RTPCodecType::Video,
+            &[RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                send_encodings: Vec::new(),
+            }],
+        )
         .await?;
 
     ice_completion.notified().await;
