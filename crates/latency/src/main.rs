@@ -12,6 +12,7 @@ use webrtc::{
         setting_engine::SettingEngine,
         APIBuilder,
     },
+    ice::{mdns::MulticastDnsMode, network_type::NetworkType},
     ice_transport::{
         ice_candidate::RTCIceCandidate, ice_connection_state::RTCIceConnectionState,
         ice_gatherer_state::RTCIceGathererState,
@@ -19,8 +20,11 @@ use webrtc::{
     interceptor::registry::Registry,
     media::Sample,
     peer_connection::{
-        configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription,
+        configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState,
+        sdp::session_description::RTCSessionDescription,
     },
+    rtcp::transport_feedbacks::transport_layer_cc::{SymbolTypeTcc, TransportLayerCc},
+    rtp::{codecs::h264::H264Packet, packetizer::Depacketizer},
     rtp_transceiver::{
         rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
         rtp_receiver::RTCRtpReceiver,
@@ -28,9 +32,8 @@ use webrtc::{
         RTCRtpTransceiverInit,
     },
     track::{
-        track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
-        track_remote::TrackRemote,
-    }, ice::mdns::MulticastDnsMode,
+        track_local::track_local_static_sample::TrackLocalStaticSample, track_remote::TrackRemote,
+    },
 };
 
 /// Peer A sends the H.264 stream
@@ -68,6 +71,8 @@ async fn peer_a(
         "webrtc-rs".to_owned(),
     ));
 
+    let has_remote_sdp = Arc::new(Notify::new());
+    let has_remote_sdp_clone = has_remote_sdp.clone();
     {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -86,26 +91,15 @@ async fn peer_a(
                 pc.set_local_description(offer).await.unwrap();
                 let answer = answer_rx.recv().await.unwrap();
                 pc.set_remote_description(answer).await.unwrap();
+                has_remote_sdp_clone.notify_one();
             }
         });
     }
 
-    let ice_completion = Arc::new(Notify::new());
-    let ice_complete = ice_completion.clone();
-    peer_connection
-        .on_ice_gathering_state_change(Box::new(move |state| {
-            if state == RTCIceGathererState::Complete {
-                ice_complete.notify_one();
-            }
-            Box::pin(async {})
-        }))
-        .await;
-
     peer_connection
         .on_ice_candidate(Box::new(move |candidate| {
             if let Some(candidate) = candidate {
-                #[cfg(debug_assertions)]
-                println!("Peer A: Found ICE candidate:\n{:?}", &candidate);
+                log::info!("Peer A: Found ICE candidate:\n{:?}", &candidate);
                 ice_tx
                     .send(candidate)
                     .expect("Peer A: Unable to send ICE candidate");
@@ -114,26 +108,66 @@ async fn peer_a(
         }))
         .await;
 
-    let rtp_transceiver = peer_connection
-        .add_transceiver_from_track(
-            Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>,
-            &[],
-        )
-        .await?;
+    let peer_connected = Arc::new(Notify::new());
+    let peer_connected_clone = peer_connected.clone();
+    peer_connection
+        .on_peer_connection_state_change(Box::new(move |state| {
+            if state == RTCPeerConnectionState::Connected {
+                peer_connected_clone.notify_one();
+            }
+            Box::pin(async {})
+        }))
+        .await;
+
+    let rtp_sender = peer_connection.add_track(video_track.clone() as _).await?;
 
     tokio::spawn(async move {
-        let mut rtcp_buf = vec![0u8; 1500];
-        if let Some(rtp_sender) = rtp_transceiver.sender().await {
-            while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {
-                println!("Peer A RTCP: {}", rtcp_buf[1]);
-                if rtcp_buf[1] == 205 {
-                    let fmt = rtcp_buf[0] & 0b11111;
-                    println!("Peer A RTCP FB: {}", fmt);
-                } else {
-                    println!("Peer A RTCP: {}", rtcp_buf[1]);
+        let mut arrival_times: Vec<i64> = Vec::new();
+
+        while let Ok((packets, _)) = rtp_sender.read_rtcp().await {
+            for packet in packets {
+                let packet = packet.as_any();
+
+                // Can be any of:
+                //
+                // SenderReport
+                // ReceiverReport
+                // SourceDescription
+                // Goodbye
+                // TransportLayerNack
+                // RapidResynchronizationRequest
+                // TransportLayerCc
+                // PictureLossIndication
+                // SliceLossIndication
+                // ReceiverEstimatedMaximumBitrate
+                // FullIntraRequest
+                // ExtendedReport
+
+                // println!("{:?}", packet.type_id());
+
+                if let Some(tcc) = packet.downcast_ref::<TransportLayerCc>() {
+                    let mut arrival_time = (tcc.reference_time * 64000) as i64;
+
+                    for recv_delta in tcc.recv_deltas.iter() {
+                        match recv_delta.type_tcc_packet {
+                            SymbolTypeTcc::PacketReceivedSmallDelta => {
+                                arrival_time += recv_delta.delta;
+                                arrival_times.push(arrival_time);
+                            }
+                            SymbolTypeTcc::PacketReceivedLargeDelta => {
+                                arrival_time += recv_delta.delta - 8192000;
+                                arrival_times.push(arrival_time);
+                            }
+                            _ => (),
+                        }
+                    }
                 }
             }
         }
+
+        // dbg!(arrival_times);
+        // let sum: i64 = recv_deltas.iter().sum();
+        // println!("Ave recv delta: {}", sum as f64 / recv_deltas.len() as f64);
     });
 
     let pc = peer_connection.clone();
@@ -143,6 +177,7 @@ async fn peer_a(
                 .to_json()
                 .await
                 .expect("Peer A: `to_json` of `RTCIceCandidate` failed");
+            has_remote_sdp.notified().await;
             pc.add_ice_candidate(candidate)
                 .await
                 .expect("Peer A: Unable to add ICE candidate");
@@ -158,7 +193,7 @@ async fn peer_a(
             .build()
             .unwrap()
             .block_on(async move {
-                ice_completion.notified().await;
+                peer_connected.notified().await;
 
                 let dur = std::time::Duration::from_nanos(16666667);
                 let mut ticker = tokio::time::interval(dur);
@@ -215,6 +250,8 @@ async fn peer_b(
     let config = RTCConfiguration::default();
     let peer_connection = Arc::new(api.new_peer_connection(config).await?);
 
+    let has_remote_sdp = Arc::new(Notify::new());
+    let has_remote_sdp_clone = has_remote_sdp.clone();
     {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -230,6 +267,7 @@ async fn peer_b(
             while let Some(_) = rx.recv().await {
                 let offer = offer_rx.recv().await.unwrap();
                 pc.set_remote_description(offer).await.unwrap();
+                has_remote_sdp_clone.notify_one();
                 let answer = pc.create_answer(None).await.unwrap();
                 pc.set_local_description(answer).await.unwrap();
                 let local_desc = pc.local_description().await.unwrap();
@@ -263,11 +301,9 @@ async fn peer_b(
 
                     let mut do_read = true;
                     let mut timestamps = timestamps.lock().await;
+                    let mut seq_nums = Vec::new();
 
-                    let mut buf = vec![0u8; 1500];
-
-                    let mut frag_starts = 0;
-                    let mut frag_ends = 0;
+                    let mut h264_packet = H264Packet::default();
 
                     while do_read {
                         tokio::select! {
@@ -275,50 +311,27 @@ async fn peer_b(
                                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                 do_read = false;
                             }
-                            v = track.read(&mut buf) => {
-                                if let Ok((len, _attributes)) = v {
-                                    let rtp_packet = &buf[..len];
-
-                                    // Almost always zero
-                                    let csrc_count = rtp_packet[0] & 0b00001111;
-
-                                    let mut m = 3 + csrc_count as usize;
-                                    if rtp_packet[0] & 0b00010000 != 0 {
-                                        // Assuming transport-cc
-                                        m += 2;
-                                    }
-                                    let nalu_header = rtp_packet[4*m];
-                                    let nalu_type = nalu_header & 0b00011111;
-
-                                    match nalu_type {
-                                        // Single NAL unit
-                                        1..=23 => {
+                            rtp = track.read_rtp() => {
+                                if let Ok((packet, _attributes)) = rtp {
+                                    seq_nums.push(packet.header.sequence_number);
+                                    if let Ok(bytes) = h264_packet.depacketize(&packet.payload) {
+                                        if !bytes.is_empty() {
                                             timestamps.push(timer_counter());
                                         }
-                                        // Fragmentation unit
-                                        28 | 29 => {
-                                            let fu_header = rtp_packet[4*m + 1];
-
-                                            // Fragmentation start bit
-                                            if fu_header & 0b10000000 != 0 {
-                                                frag_starts += 1;
-                                            }
-
-                                            // Fragmentation end bit
-                                            if fu_header & 0b01000000 != 0 {
-                                                timestamps.push(timer_counter());
-                                                frag_ends += 1;
-                                            }
-                                        }
-                                        _a => (), //println!("nalu_type: {}", a)
                                     }
                                 }
                             }
                         }
                     }
 
-                    println!("S: {}", frag_starts);
-                    println!("E: {}", frag_ends);
+                    let mut iter = seq_nums.iter();
+                    let mut prev = iter.next().unwrap();
+                    while let Some(sn) = iter.next() {
+                        if sn - prev != 1 {
+                            println!("{}", sn);
+                        }
+                        prev = sn;
+                    } 
                 })
             },
         ))
@@ -338,8 +351,7 @@ async fn peer_b(
     peer_connection
         .on_ice_candidate(Box::new(move |candidate| {
             if let Some(candidate) = candidate {
-                #[cfg(debug_assertions)]
-                println!("Peer B: Found ICE candidate:\n{:?}", &candidate);
+                log::info!("Peer B: Found ICE candidate:\n{:?}", &candidate);
                 ice_tx
                     .send(candidate)
                     .expect("Peer B: Unable to send ICE candidate");
@@ -355,6 +367,7 @@ async fn peer_b(
                 .to_json()
                 .await
                 .expect("Peer B: `to_json` of `RTCIceCandidate` failed");
+            has_remote_sdp.notified().await;
             pc.add_ice_candidate(candidate)
                 .await
                 .expect("Peer B: Unable to add ICE candidate");
@@ -378,6 +391,8 @@ async fn peer_b(
 }
 
 fn main() {
+    env_logger::init();
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
